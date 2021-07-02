@@ -539,6 +539,7 @@ struct dwc3_msm {
 
 	bool			perf_mode;
 	bool			usb_data_enabled;
+	bool			ext_typec_switch;
 };
 
 #define USB_HSPHY_3P3_VOL_MIN		3050000 /* uV */
@@ -4101,13 +4102,8 @@ static int dwc3_msm_vbus_notifier(struct notifier_block *nb,
 	if (!edev || !mdwc)
 		return NOTIFY_DONE;
 
-	if (!mdwc->usb_data_enabled) {
-		if (event)
-			dwc3_msm_gadget_vbus_draw(mdwc, 500);
-		else
-			dwc3_msm_gadget_vbus_draw(mdwc, 0);
+	if (!mdwc->usb_data_enabled)
 		return NOTIFY_DONE;
-	}
 
 	dwc = platform_get_drvdata(mdwc->dwc3);
 
@@ -5167,6 +5163,8 @@ static int dwc3_msm_probe(struct platform_device *pdev)
 		dwc3_ext_event_notify(mdwc);
 	}
 
+	/* set the initial value */
+	mdwc->usb_data_enabled = true;
 	device_create_file(&pdev->dev, &dev_attr_orientation);
 	device_create_file(&pdev->dev, &dev_attr_mode);
 	device_create_file(&pdev->dev, &dev_attr_speed);

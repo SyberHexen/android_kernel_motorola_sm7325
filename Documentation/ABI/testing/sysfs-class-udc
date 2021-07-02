@@ -13,4 +13,3 @@ Description:
 
 		Disable USB data functionality
 		# echo 0 > /sys/class/udc/.../device/usb_data_enabled
-
