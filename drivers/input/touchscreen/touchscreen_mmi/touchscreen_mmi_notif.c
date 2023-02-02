@@ -42,11 +42,28 @@ extern struct blocking_notifier_head dsi_freq_head;
 					touch_cdev->mdata->power && \
 					IS_DEEPSLEEP_MODE)
 
+#ifdef CONFIG_BOARD_USES_DOUBLE_TAP_CTRL
 static int ts_mmi_queued_stop(struct ts_mmi_dev *touch_cdev) {
+#else
+enum ts_mmi_work {
+	TS_MMI_DO_RESUME,
+	TS_MMI_DO_PS,
+	TS_MMI_DO_REFRESH_RATE,
+	TS_MMI_DO_FPS,
+	TS_MMI_TASK_INIT,
+};
+
+static int ts_mmi_panel_off(struct ts_mmi_dev *touch_cdev) {
+#endif
+
 	int ret = 0;
 
 	if (atomic_cmpxchg(&touch_cdev->touch_stopped, 0, 1) == 1)
 		return 0;
+
+#ifndef CONFIG_BOARD_USES_DOUBLE_TAP_CTRL
+	atomic_set(&touch_cdev->resume_should_stop, 1);
+#endif
 
 	TRY_TO_CALL(pre_suspend);
 	if (touch_cdev->pdata.gestures_enabled) {
@@ -71,13 +88,12 @@ static int ts_mmi_queued_stop(struct ts_mmi_dev *touch_cdev) {
 			touch_cdev->pm_mode = TS_MMI_PM_GESTURE;
 		}
 #else
-		if(ts_mmi_is_sensor_enable()) {
-			dev_info(DEV_MMI, "%s: try to enter Gesture mode\n", __func__);
-			TRY_TO_CALL(panel_state, touch_cdev->pm_mode, TS_MMI_PM_GESTURE);
-			touch_cdev->pm_mode = TS_MMI_PM_GESTURE;
-		}
+		dev_info(DEV_MMI, "%s: try to enter Gesture mode\n", __func__);
+		TRY_TO_CALL(panel_state, touch_cdev->pm_mode, TS_MMI_PM_GESTURE);
+		touch_cdev->pm_mode = TS_MMI_PM_GESTURE;
 #endif
 	}
+
 	if (IS_ACTIVE_MODE) {
 		/* IC power is off. IRQ pin status is floated. So disable IRQ. */
 		dev_info(DEV_MMI, "%s: try to enter Deepsleep mode\n", __func__);
@@ -92,16 +108,21 @@ static int ts_mmi_queued_stop(struct ts_mmi_dev *touch_cdev) {
 #endif
 	TRY_TO_CALL(post_suspend);
 
+#ifdef CONFIG_BOARD_USES_DOUBLE_TAP_CTRL
 	if (NEED_TO_SET_PINCTRL) {
 		dev_dbg(DEV_MMI, "%s: touch pinctrl off\n", __func__);
 		TRY_TO_CALL(pinctrl, TS_MMI_PINCTL_OFF);
 	}
+#else
+	touch_cdev->double_tap_enabled_prev = false;
+#endif
 
 	dev_info(DEV_MMI, "%s: done\n", __func__);
 
 	return 0;
 }
 
+#ifdef CONFIG_BOARD_USES_DOUBLE_TAP_CTRL
 static int ts_mmi_panel_off(struct ts_mmi_dev *touch_cdev)
 {
 	kfifo_put(&touch_cdev->cmd_pipe, TS_MMI_DO_SLEEP);
@@ -125,8 +146,14 @@ static int ts_mmi_power_on(struct ts_mmi_dev *touch_cdev)
 	/* and false otherwise, thus return 0 on success to comply POSIX */
 	return schedule_delayed_work(&touch_cdev->work, 0) == false;
 }
+#endif
 
 static int inline ts_mmi_panel_on(struct ts_mmi_dev *touch_cdev) {
+#ifndef CONFIG_BOARD_USES_DOUBLE_TAP_CTRL
+	touch_cdev->double_tap_pressed = false;
+
+	atomic_set(&touch_cdev->resume_should_stop, 0);
+#endif
 	kfifo_put(&touch_cdev->cmd_pipe, TS_MMI_DO_RESUME);
 	/* schedule_delayed_work returns true if work has been scheduled */
 	/* and false otherwise, thus return 0 on success to comply POSIX */
@@ -141,18 +168,57 @@ static int ts_mmi_panel_event_handle(struct ts_mmi_dev *touch_cdev, enum ts_mmi_
 	/* for in-cell design touch solutions */
 	switch (event) {
 	case TS_MMI_EVENT_PRE_DISPLAY_OFF:
+#ifdef CONFIG_BOARD_USES_DOUBLE_TAP_CTRL
 		ts_mmi_panel_off(touch_cdev);
+#else
+		cancel_delayed_work_sync(&touch_cdev->work);
+		ts_mmi_panel_off(touch_cdev);
+		if (NEED_TO_SET_PINCTRL) {
+			dev_dbg(DEV_MMI, "%s: touch pinctrl off\n", __func__);
+			TRY_TO_CALL(pinctrl, TS_MMI_PINCTL_OFF);
+		}
+#endif
 		break;
 
 	case TS_MMI_EVENT_DISPLAY_OFF:
+#ifdef CONFIG_BOARD_USES_DOUBLE_TAP_CTRL
 		ts_mmi_power_off(touch_cdev);
+#else
+		if (NEED_TO_SET_POWER) {
+			/* then proceed with de-powering */
+			TRY_TO_CALL(power, TS_MMI_POWER_OFF);
+			dev_dbg(DEV_MMI, "%s: touch powered off\n", __func__);
+		}
+#endif
 		break;
 
 	case TS_MMI_EVENT_PRE_DISPLAY_ON:
+#ifdef CONFIG_BOARD_USES_DOUBLE_TAP_CTRL
 		ts_mmi_power_on(touch_cdev);
+#else
+		if (NEED_TO_SET_POWER) {
+			/* powering on early */
+			TRY_TO_CALL(power, TS_MMI_POWER_ON);
+			dev_dbg(DEV_MMI, "%s: touch powered on\n", __func__);
+		} else if (touch_cdev->pdata.reset &&
+			touch_cdev->mdata->reset) {
+			/* Power is not off in previous suspend.
+			 * But need reset IC in resume.
+			 */
+			dev_dbg(DEV_MMI, "%s: resetting...\n", __func__);
+			TRY_TO_CALL(reset, TS_MMI_RESET_HARD);
+		}
+#endif
 		break;
 
 	case TS_MMI_EVENT_DISPLAY_ON:
+#ifndef CONFIG_BOARD_USES_DOUBLE_TAP_CTRL
+		/* out of reset to allow wait for boot complete */
+		if (NEED_TO_SET_PINCTRL) {
+			TRY_TO_CALL(pinctrl, TS_MMI_PINCTL_ON);
+			dev_dbg(DEV_MMI, "%s: touch pinctrl_on\n", __func__);
+		}
+#endif
 		ts_mmi_panel_on(touch_cdev);
 		break;
 
@@ -183,17 +249,29 @@ static void ts_mmi_panel_cb(enum panel_event_notifier_tag tag,
 
 	dev_dbg(DEV_MMI, "%s: %s Notify_type=%d, early=%d\n", __func__,
 		EVENT_PRE_DISPLAY_OFF ? "EVENT_PRE_DISPLAY_OFF" :
+#ifdef CONFIG_BOARD_USES_DOUBLE_TAP_CTRL
 		(EVENT_DISPLAY_LP ? "EVENT_DISPLAY_LP" :
+#endif
 		(EVENT_DISPLAY_OFF ?     "EVENT_DISPLAY_OFF" :
 		(EVENT_PRE_DISPLAY_ON ?   "EVENT_PRE_DISPLAY_ON" :
+#ifdef CONFIG_BOARD_USES_DOUBLE_TAP_CTRL
 		(EVENT_DISPLAY_ON ?       "EVENT_DISPLAY_ON" : "Unknown")))),
+#else
+		(EVENT_DISPLAY_ON ?       "EVENT_DISPLAY_ON" : "Unknown"))),
+#endif
 		event, (evdata.early_trigger ? 1 : 0));
 
 	panel_event = EVENT_PRE_DISPLAY_OFF ? TS_MMI_EVENT_PRE_DISPLAY_OFF :
+#ifdef CONFIG_BOARD_USES_DOUBLE_TAP_CTRL
 		(EVENT_DISPLAY_LP ? TS_MMI_EVENT_PRE_DISPLAY_OFF :
+#endif
 		(EVENT_DISPLAY_OFF ? TS_MMI_EVENT_DISPLAY_OFF :
 		(EVENT_PRE_DISPLAY_ON ? TS_MMI_EVENT_PRE_DISPLAY_ON :
+#ifdef CONFIG_BOARD_USES_DOUBLE_TAP_CTRL
 		(EVENT_DISPLAY_ON ? TS_MMI_EVENT_DISPLAY_ON : TS_MMI_EVENT_UNKNOWN))));
+#else
+		(EVENT_DISPLAY_ON ? TS_MMI_EVENT_DISPLAY_ON : TS_MMI_EVENT_UNKNOWN)));
+#endif
 
 	ts_mmi_panel_event_handle(touch_cdev, panel_event);
 
@@ -216,20 +294,33 @@ static int ts_mmi_panel_cb(struct notifier_block *nb,
 
 	dev_dbg(DEV_MMI,"%s: %s event(%lu), ctrl_dsi=%d, idx=%d\n", __func__,
 		EVENT_PRE_DISPLAY_OFF ? "EVENT_PRE_DISPLAY_OFF" :
+#ifdef CONFIG_BOARD_USES_DOUBLE_TAP_CTRL
 		(EVENT_DISPLAY_LP ? "EVENT_DISPLAY_LP" :
+#endif
 		(EVENT_DISPLAY_OFF ?     "EVENT_DISPLAY_OFF" :
 		(EVENT_PRE_DISPLAY_ON ?   "EVENT_PRE_DISPLAY_ON" :
+#ifdef CONFIG_BOARD_USES_DOUBLE_TAP_CTRL
 		(EVENT_DISPLAY_ON ?       "EVENT_DISPLAY_ON" : "Unknown")))),
+#else
+		(EVENT_DISPLAY_ON ?       "EVENT_DISPLAY_ON" : "Unknown"))),
+#endif
 		event, touch_cdev->pdata.ctrl_dsi, idx);
 
 	if (touch_cdev->pdata.ctrl_dsi != idx)
 		return 0;
 
 	panel_event = EVENT_PRE_DISPLAY_OFF ? TS_MMI_EVENT_PRE_DISPLAY_OFF :
+#ifdef CONFIG_BOARD_USES_DOUBLE_TAP_CTRL
 		(EVENT_DISPLAY_LP ? TS_MMI_EVENT_PRE_DISPLAY_OFF :
+#endif
 		(EVENT_DISPLAY_OFF ? TS_MMI_EVENT_DISPLAY_OFF :
 		(EVENT_PRE_DISPLAY_ON ? TS_MMI_EVENT_PRE_DISPLAY_ON :
+#ifdef CONFIG_BOARD_USES_DOUBLE_TAP_CTRL
 		(EVENT_DISPLAY_ON ? TS_MMI_EVENT_DISPLAY_ON : TS_MMI_EVENT_UNKNOWN))));
+
+#else
+		(EVENT_DISPLAY_ON ? TS_MMI_EVENT_DISPLAY_ON : TS_MMI_EVENT_UNKNOWN)));
+#endif
 
 	ret = ts_mmi_panel_event_handle(touch_cdev, panel_event);
 
@@ -257,6 +348,7 @@ static inline void ts_mmi_restore_settings(struct ts_mmi_dev *touch_cdev)
 	dev_dbg(DEV_MMI, "%s: done\n", __func__);
 }
 
+#ifdef CONFIG_BOARD_USES_DOUBLE_TAP_CTRL
 static void ts_mmi_queued_power_on(struct ts_mmi_dev *touch_cdev)
 {
 	int ret = 0;
@@ -285,6 +377,7 @@ static void ts_mmi_queued_power_off(struct ts_mmi_dev *touch_cdev)
 		dev_dbg(DEV_MMI, "%s: touch powered off\n", __func__);
 	}
 }
+#endif
 
 static void ts_mmi_queued_resume(struct ts_mmi_dev *touch_cdev)
 {
@@ -294,11 +387,13 @@ static void ts_mmi_queued_resume(struct ts_mmi_dev *touch_cdev)
 	if (atomic_cmpxchg(&touch_cdev->touch_stopped, 1, 0) == 0)
 		return;
 
+#ifdef CONFIG_BOARD_USES_DOUBLE_TAP_CTRL
 	/* out of reset to allow wait for boot complete */
 	if (NEED_TO_SET_PINCTRL) {
 		TRY_TO_CALL(pinctrl, TS_MMI_PINCTL_ON);
 		dev_dbg(DEV_MMI, "%s: touch pinctrl_on\n", __func__);
 	}
+#endif
 
 #ifdef TS_MMI_TOUCH_MULTIWAY_UPDATE_FW
 	if (touch_cdev->flash_mode == FW_PARAM_MODE &&\
@@ -324,9 +419,12 @@ static void ts_mmi_queued_resume(struct ts_mmi_dev *touch_cdev)
 			touch_cdev->delay_baseline_update = false;
 		}
 	}
+#ifdef CONFIG_BOARD_USES_DOUBLE_TAP_CTRL
 	if (touch_cdev->pdata.fod_detection) {
 		TRY_TO_CALL(update_fod_mode, touch_cdev->fps_state);
 	}
+#endif
+
 	if (NEED_TO_SET_POWER) {
 		/* power turn on in PANEL_EVENT_PRE_DISPLAY_ON.
 		 * IC need some time to boot up.
@@ -360,9 +458,11 @@ static void ts_mmi_queued_resume(struct ts_mmi_dev *touch_cdev)
 	 */
 	mutex_lock(&touch_cdev->extif_mutex);
 	ts_mmi_restore_settings(touch_cdev);
+#ifdef CONFIG_BOARD_USES_DOUBLE_TAP_CTRL
 	touch_cdev->single_tap_pressed = false;
 	touch_cdev->double_tap_pressed = false;
 	touch_cdev->udfps_pressed = false;
+#endif
 	touch_cdev->pm_mode = TS_MMI_PM_ACTIVE;
 	mutex_unlock(&touch_cdev->extif_mutex);
 	dev_info(DEV_MMI, "%s: done\n", __func__);
@@ -378,14 +478,23 @@ static void ts_mmi_worker_func(struct work_struct *w)
 
 	while (kfifo_get(&touch_cdev->cmd_pipe, &cmd)) {
 		switch (cmd) {
+#ifdef CONFIG_BOARD_USES_DOUBLE_TAP_CTRL
 		case TS_MMI_DO_POWER_ON:
 			ts_mmi_queued_power_on(touch_cdev);
 			break;
-
+#endif
 		case TS_MMI_DO_RESUME:
+#ifndef CONFIG_BOARD_USES_DOUBLE_TAP_CTRL
+			ret = atomic_read(&touch_cdev->resume_should_stop);
+			if (ret) {
+				dev_info(DEV_MMI, "%s: resume cancelled\n", __func__);
+				break;
+			}
+#endif
 			ts_mmi_queued_resume(touch_cdev);
 				break;
 
+#ifdef CONFIG_BOARD_USES_DOUBLE_TAP_CTRL
 		case TS_MMI_DO_SLEEP:
 			ts_mmi_queued_stop(touch_cdev);
 			break;
@@ -393,7 +502,7 @@ static void ts_mmi_worker_func(struct work_struct *w)
 		case TS_MMI_DO_POWER_OFF:
 			ts_mmi_queued_power_off(touch_cdev);
 			break;
-
+#endif
 		case TS_MMI_DO_PS:
 			TRY_TO_CALL(charger_mode, (int)touch_cdev->ps_is_present);
 				break;
@@ -402,6 +511,7 @@ static void ts_mmi_worker_func(struct work_struct *w)
 			TRY_TO_CALL(refresh_rate, (int)touch_cdev->refresh_rate);
 				break;
 		case TS_MMI_DO_FPS:
+#ifdef CONFIG_BOARD_USES_DOUBLE_TAP_CTRL
 			if (touch_cdev->pdata.fps_detection) {
 				if (touch_cdev->fps_state) {/* on */
 					TRY_TO_CALL(update_baseline, TS_MMI_UPDATE_BASELINE_OFF);
@@ -416,6 +526,16 @@ static void ts_mmi_worker_func(struct work_struct *w)
 			}
 			if (touch_cdev->pdata.fod_detection) {
 				TRY_TO_CALL(update_fod_mode, touch_cdev->fps_state);
+#else
+			if (touch_cdev->fps_state) {/* on */
+				TRY_TO_CALL(update_baseline, TS_MMI_UPDATE_BASELINE_OFF);
+				touch_cdev->delay_baseline_update = true;
+			} else { /* off */
+				if (touch_cdev->delay_baseline_update) {
+					TRY_TO_CALL(update_baseline, TS_MMI_UPDATE_BASELINE_ON);
+					touch_cdev->delay_baseline_update = false;
+				}
+#endif
 			}
 				break;
 
@@ -434,6 +554,7 @@ static void ts_mmi_worker_func(struct work_struct *w)
 			}
 				break;
 
+#ifdef CONFIG_BOARD_USES_DOUBLE_TAP_CTRL
 		case TS_MMI_SET_GESTURES:
 			if (!atomic_read(&touch_cdev->touch_stopped))
 				break;
@@ -444,6 +565,7 @@ static void ts_mmi_worker_func(struct work_struct *w)
 			ts_mmi_queued_power_off(touch_cdev);
 
 			break;
+#endif
 
 		default:
 			dev_dbg(DEV_MMI, "%s: unknown command %d\n", __func__, cmd);
@@ -630,8 +752,11 @@ int ts_mmi_notifiers_register(struct ts_mmi_dev *touch_cdev)
 		if (ret)
 			goto FREQ_NOTIF_REGISTER_FAILED;
 	}
-
+#ifdef CONFIG_BOARD_USES_DOUBLE_TAP_CTRL
 	if (touch_cdev->pdata.fps_detection || touch_cdev->pdata.fod_detection) {
+#else
+	if (touch_cdev->pdata.fps_detection) {
+#endif
 		ret = ts_mmi_fps_notifier_register(touch_cdev, true);
 		if (ret < 0)
 			dev_err(DEV_TS,
@@ -655,8 +780,11 @@ void ts_mmi_notifiers_unregister(struct ts_mmi_dev *touch_cdev)
 		dev_err(DEV_MMI, "%s:touch_cdev->class_dev == NULL", __func__);
 		return;
 	}
-
+#ifdef CONFIG_BOARD_USES_DOUBLE_TAP_CTRL
 	if (touch_cdev->pdata.fps_detection || touch_cdev->pdata.fod_detection)
+#else
+	if (touch_cdev->pdata.fps_detection)
+#endif
 		ts_mmi_fps_notifier_register(touch_cdev, false);
 
 	if (touch_cdev->pdata.update_refresh_rate)

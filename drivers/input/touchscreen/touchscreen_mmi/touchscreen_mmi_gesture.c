@@ -212,7 +212,9 @@ static inline void update_poison_center(struct touch_event_data *tev)
 
 static void ts_mmi_single_tap_handler(struct ts_mmi_dev *touch_cdev)
 {
+#ifdef CONFIG_BOARD_USES_DOUBLE_TAP_CTRL
 	unsigned char mode_type = touch_cdev->gesture_mode_type;
+#endif
 	ktime_t now, tmp;
 
 	if (!touch_cdev->single_tap_pressed) {
@@ -222,6 +224,11 @@ static void ts_mmi_single_tap_handler(struct ts_mmi_dev *touch_cdev)
 	}
 
 	touch_cdev->single_tap_pressed = false;
+
+#ifndef CONFIG_BOARD_USES_DOUBLE_TAP_CTRL
+	if (!touch_cdev->double_tap_enabled)
+		return;
+#endif
 
 	now = ktime_get_boottime();
 	tmp = ktime_add(touch_cdev->single_tap_pressed_time,
@@ -236,42 +243,55 @@ static void ts_mmi_single_tap_handler(struct ts_mmi_dev *touch_cdev)
 
 static int ts_mmi_gesture_handler(struct gesture_event_data *gev)
 {
+#ifndef CONFIG_BOARD_USES_DOUBLE_TAP_CTRL
+	struct ts_mmi_dev *touch_cdev = events_data->touch_cdev;
+#endif
 	int key_code;
+#ifdef CONFIG_BOARD_USES_DOUBLE_TAP_CTRL
 	struct ts_mmi_dev *touch_cdev = sensor_pdata->touch_cdev;
 	unsigned char mode_type = touch_cdev->gesture_mode_type;
+#else
+	bool need2report = true;
+#endif
 
 	switch (gev->evcode) {
 	case 1:
+#ifdef CONFIG_BOARD_USES_DOUBLE_TAP_CTRL
 		if (!(mode_type & TS_MMI_GESTURE_SINGLE))
 			return 1;
-
+#endif
 		ts_mmi_single_tap_handler(touch_cdev);
 		key_code = KEY_F1;
 		pr_info("%s: single tap\n", __func__);
 			break;
 	case 2:
+#ifdef CONFIG_BOARD_USES_DOUBLE_TAP_CTRL
 		if (!(mode_type & TS_MMI_GESTURE_ZERO))
 			return 1;
 
 		touch_cdev->udfps_pressed = true;
 		sysfs_notify(&DEV_MMI->kobj, NULL, "udfps_pressed");
-
+#endif
 		key_code = KEY_F2;
+#ifdef CONFIG_BOARD_USES_DOUBLE_TAP_CTRL
 		if(gev->evdata.x == 0)
 			gev->evdata.x = touch_cdev->pdata.fod_x ;
 		if(gev->evdata.y== 0)
 			gev->evdata.y = touch_cdev->pdata.fod_y;
+#endif
 		input_report_abs(sensor_pdata->input_sensor_dev, ABS_X, gev->evdata.x);
 		input_report_abs(sensor_pdata->input_sensor_dev, ABS_Y, gev->evdata.y);
 		pr_info("%s: zero tap; x=%x, y=%x\n", __func__, gev->evdata.x, gev->evdata.y);
 		break;
 	case 3:
+#ifdef CONFIG_BOARD_USES_DOUBLE_TAP_CTRL
 		if (!(mode_type & TS_MMI_GESTURE_ZERO))
 			return 1;
-
+#endif
 		key_code = KEY_F3;
 		pr_info("%s: zero tap up\n", __func__);
 		break;
+#ifdef CONFIG_BOARD_USES_DOUBLE_TAP_CTRL
 	case 4:
 		if (!(mode_type & TS_MMI_GESTURE_DOUBLE))
 			return 1;
@@ -281,10 +301,20 @@ static int ts_mmi_gesture_handler(struct gesture_event_data *gev)
 		touch_cdev->double_tap_pressed = true;
 		sysfs_notify(&DEV_MMI->kobj, NULL, "double_tap_pressed");
 		break;
+#endif
 	default:
+#ifdef CONFIG_BOARD_USES_DOUBLE_TAP_CTRL
 		pr_info("%s: unknown id=%x\n", __func__, gev->evcode);
 		return 1;
 	}
+#else
+		need2report = false;
+		pr_info("%s: unknown id=%x\n", __func__, gev->evcode);
+	}
+
+	if (!need2report)
+		return 1;
+#endif
 
 	input_report_key(sensor_pdata->input_sensor_dev, key_code, 1);
 	input_sync(sensor_pdata->input_sensor_dev);
@@ -415,6 +445,11 @@ bool ts_mmi_is_sensor_enable(void)
 	struct ts_mmi_dev *touch_cdev;
 	if (sensor_pdata != NULL) {
 		touch_cdev = sensor_pdata->touch_cdev;
+#ifndef CONFIG_BOARD_USES_DOUBLE_TAP_CTRL
+		if (touch_cdev->double_tap_enabled_prev)
+			return true;
+#endif
+
 		return !!sensor_pdata->sensor_opened;
 	}
 	else
@@ -424,7 +459,6 @@ bool ts_mmi_is_sensor_enable(void)
 static int ts_mmi_sensor_set_enable(struct sensors_classdev *sensors_cdev,
 		unsigned int enable)
 {
-#ifndef CONFIG_BOARD_USES_DOUBLE_TAP_CTRL
 	struct ts_mmi_sensor_platform_data *sensor_pdata = container_of(
 			sensors_cdev, struct ts_mmi_sensor_platform_data, ps_cdev);
 	struct ts_mmi_dev *touch_cdev = sensor_pdata->touch_cdev;
@@ -437,7 +471,6 @@ static int ts_mmi_sensor_set_enable(struct sensors_classdev *sensors_cdev,
 	} else {
 		dev_err(DEV_TS, "%s: unknown enable symbol\n", __func__);
 	}
-#endif
 	return 0;
 }
 
@@ -474,7 +507,7 @@ static struct sensors_classdev __maybe_unused sensors_touch_cdev = {
 	.flags = 1 | 6,
 	.fifo_reserved_event_count = 0,
 	.fifo_max_event_count = 0,
-	.enabled = 0,
+	.enabled = 1,
 	.delay_msec = 200,
 	.sensors_enable = NULL,
 	.sensors_poll_delay = NULL,
@@ -492,7 +525,11 @@ static struct sensors_classdev __maybe_unused palm_sensors_touch_cdev = {
 	.max_delay = 0,
 	.fifo_reserved_event_count = 0,
 	.fifo_max_event_count = 0,
+#ifdef CONFIG_BOARD_USES_DOUBLE_TAP_CTRL
 	.enabled = 0,
+#else
+	.enabled = 1,
+#endif
 	.delay_msec = 200,
 	.sensors_enable = NULL,
 	.sensors_poll_delay = NULL,
@@ -540,7 +577,9 @@ int ts_mmi_gesture_init(struct ts_mmi_dev *touch_cdev)
 	__set_bit(KEY_F1, sensor_input_dev->keybit);
 	__set_bit(KEY_F2, sensor_input_dev->keybit);
 	__set_bit(KEY_F3, sensor_input_dev->keybit);
+#ifdef CONFIG_BOARD_USES_DOUBLE_TAP_CTRL
 	__set_bit(KEY_F4, sensor_input_dev->keybit);
+#endif
 	__set_bit(EV_ABS, sensor_input_dev->evbit);
 	__set_bit(EV_SYN, sensor_input_dev->evbit);
 	/* TODO: fill in real screen resolution */

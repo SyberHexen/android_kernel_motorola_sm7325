@@ -407,14 +407,20 @@ static ssize_t gesture_store(struct device *dev,
 	return size;
 }
 static DEVICE_ATTR(gesture, (S_IWUSR | S_IWGRP | S_IRUGO), gesture_show, gesture_store);
+#endif
 
 static ssize_t double_tap_enabled_show(struct device *dev,
 				       struct device_attribute *attr, char *buf)
 {
 	struct ts_mmi_dev *touch_cdev = dev_get_drvdata(dev);
 
+#ifdef CONFIG_BOARD_USES_DOUBLE_TAP_CTRL
 	return snprintf(buf, PAGE_SIZE, "%u\n",
 			!!(touch_cdev->gesture_mode_type & TS_MMI_GESTURE_SINGLE));
+#else
+	return snprintf(buf, PAGE_SIZE, "%u\n", touch_cdev->double_tap_enabled);
+#endif
+
 }
 static ssize_t double_tap_enabled_store(struct device *dev,
 					struct device_attribute *attr,
@@ -422,7 +428,15 @@ static ssize_t double_tap_enabled_store(struct device *dev,
 {
 	struct ts_mmi_dev *touch_cdev = dev_get_drvdata(dev);
 
+#ifdef CONFIG_BOARD_USES_DOUBLE_TAP_CTRL
 	gesture_set(touch_cdev, TS_MMI_GESTURE_SINGLE, buf[0] != '0');
+#else
+	touch_cdev->double_tap_enabled = buf[0] != '0';
+
+	if (touch_cdev->double_tap_enabled)
+		touch_cdev->double_tap_enabled_prev = true;
+
+#endif
 
 	return count;
 }
@@ -438,6 +452,7 @@ static ssize_t double_tap_pressed_show(struct device *dev,
 }
 static DEVICE_ATTR_RO(double_tap_pressed);
 
+#ifdef CONFIG_BOARD_USES_DOUBLE_TAP_CTRL
 static ssize_t udfps_enabled_show(struct device *dev,
 				  struct device_attribute *attr, char *buf)
 {
@@ -497,10 +512,10 @@ static struct attribute *sysfs_class_attrs[] = {
 	&dev_attr_poison_distance.attr,
 	&dev_attr_poison_trigger_distance.attr,
 #endif
-#ifdef CONFIG_BOARD_USES_DOUBLE_TAP_CTRL
-	&dev_attr_gesture.attr,
 	&dev_attr_double_tap_enabled.attr,
 	&dev_attr_double_tap_pressed.attr,
+#ifdef CONFIG_BOARD_USES_DOUBLE_TAP_CTRL
+	&dev_attr_gesture.attr,
 	&dev_attr_udfps_enabled.attr,
 	&dev_attr_udfps_pressed.attr,
 #endif
