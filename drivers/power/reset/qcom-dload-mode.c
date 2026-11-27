@@ -6,6 +6,7 @@
 #include <linux/delay.h>
 #include <linux/err.h>
 #include <linux/init.h>
+#include <linux/input.h>
 #include <linux/kernel.h>
 #include <linux/io.h>
 #include <linux/of.h>
@@ -15,6 +16,8 @@
 #include <linux/reboot.h>
 #include <linux/pm.h>
 #include <linux/qcom_scm.h>
+#include <linux/slab.h>
+#include <linux/workqueue.h>
 #include <soc/qcom/minidump.h>
 
 enum qcom_download_dest {
@@ -383,6 +386,106 @@ static void check_pci_edl(struct device_node *np)
 	iounmap(mem);
 }
 
+static struct work_struct longpress_work;
+static bool power_pressed;
+static bool vol_down_pressed;
+static bool vol_up_pressed;
+
+static void longpress_work_func(struct work_struct *work)
+{
+	/*
+	 * Keep DDR powered so that pstore survives into recovery: the qcom_scm
+	 * restart handler only issues the warm reset when reboot_mode says so.
+	 */
+	reboot_mode = REBOOT_WARM;
+	kernel_restart("recovery");
+}
+
+static void longpress_event(struct input_handle *handle, unsigned int type,
+			    unsigned int code, int value)
+{
+	if (type != EV_KEY)
+		return;
+
+	switch (code) {
+	case KEY_POWER:
+		power_pressed = value;
+		break;
+	case KEY_VOLUMEDOWN:
+		vol_down_pressed = value;
+		break;
+	case KEY_VOLUMEUP:
+		vol_up_pressed = value;
+		break;
+	default:
+		return;
+	}
+
+	if (!power_pressed || !vol_down_pressed || !vol_up_pressed)
+		return;
+
+	schedule_work(&longpress_work);
+}
+
+static int longpress_connect(struct input_handler *handler,
+			     struct input_dev *dev,
+			     const struct input_device_id *id)
+{
+	struct input_handle *handle;
+	int rc;
+
+	handle = kzalloc(sizeof(*handle), GFP_KERNEL);
+	if (!handle)
+		return -ENOMEM;
+
+	handle->dev = dev;
+	handle->handler = handler;
+	handle->name = handler->name;
+
+	rc = input_register_handle(handle);
+	if (rc) {
+		pr_err("failed to register input handle\n");
+		goto error;
+	}
+
+	rc = input_open_device(handle);
+	if (rc) {
+		pr_err("failed to open input device\n");
+		goto error_unregister;
+	}
+
+	return 0;
+
+error_unregister:
+	input_unregister_handle(handle);
+error:
+	kfree(handle);
+	return rc;
+}
+
+static void longpress_disconnect(struct input_handle *handle)
+{
+	input_close_device(handle);
+	input_unregister_handle(handle);
+	kfree(handle);
+}
+
+static const struct input_device_id longpress_ids[] = {
+	{
+		.flags = INPUT_DEVICE_ID_MATCH_EVBIT,
+		.evbit = { [BIT_WORD(EV_KEY)] = BIT_MASK(EV_KEY) },
+	},
+	{ },
+};
+
+static struct input_handler longpress_handler = {
+	.event = longpress_event,
+	.connect = longpress_connect,
+	.disconnect = longpress_disconnect,
+	.name = "dload_mode",
+	.id_table = longpress_ids,
+};
+
 static int qcom_dload_probe(struct platform_device *pdev)
 {
 	struct qcom_dload *poweroff;
@@ -436,6 +539,10 @@ static int qcom_dload_probe(struct platform_device *pdev)
 	poweroff->restart_nb.priority = 201;
 	register_restart_handler(&poweroff->restart_nb);
 
+	INIT_WORK(&longpress_work, longpress_work_func);
+	if (input_register_handler(&longpress_handler))
+		pr_err("failed to register the long press handler\n");
+
 	platform_set_drvdata(pdev, poweroff);
 
 	return 0;
@@ -444,6 +551,9 @@ static int qcom_dload_probe(struct platform_device *pdev)
 static int qcom_dload_remove(struct platform_device *pdev)
 {
 	struct qcom_dload *poweroff = platform_get_drvdata(pdev);
+
+	input_unregister_handler(&longpress_handler);
+	cancel_work_sync(&longpress_work);
 
 	atomic_notifier_chain_unregister(&panic_notifier_list,
 					 &poweroff->panic_nb);
