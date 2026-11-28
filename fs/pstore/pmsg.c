@@ -6,6 +6,7 @@
 #include <linux/cdev.h>
 #include <linux/device.h>
 #include <linux/fs.h>
+#include <linux/slab.h>
 #include <linux/uaccess.h>
 #include <linux/uio.h>
 #include "internal.h"
@@ -202,6 +203,61 @@ static bool pmsg_is_message(unsigned long part)
 char name_tag_end[] = ": ";
 char message_end[] = "\n";
 
+/*
+ * logd forwards each entry as one payload after the two headers: the
+ * priority byte, the NUL terminated tag and the NUL terminated message.
+ */
+#define PMSG_PAYLOAD_MAX	4096
+
+static bool pmsg_is_payload(unsigned long part, unsigned long nr_segs,
+			    const struct iovec *iov)
+{
+	return part == 2 && nr_segs == 3 && iov->iov_len >= 3;
+}
+
+static void pmsg_write_payload(const struct iovec *iov)
+{
+	size_t len = min_t(size_t, iov->iov_len, PMSG_PAYLOAD_MAX);
+	size_t tag_len, msg_len, out_len;
+	char *buf, *out, *tag, *msg;
+	u8 prio;
+
+	buf = kmalloc(len, GFP_KERNEL);
+	if (!buf)
+		return;
+
+	if (copy_from_user(buf, iov->iov_base, len))
+		goto out_free;
+
+	prio = buf[0];
+	if (prio >= ANDROID_LOG_SILENT)
+		prio = ANDROID_LOG_FATAL;
+
+	tag = buf + 1;
+	tag_len = strnlen(tag, len - 1);
+	if (tag_len >= len - 1)
+		goto out_free;
+
+	msg = tag + tag_len + 1;
+	msg_len = strnlen(msg, len - 1 - tag_len - 1);
+	while (msg_len && msg[msg_len - 1] == '\n')
+		msg_len--;
+
+	/* "P tag: message\n" */
+	out = kmalloc(tag_len + msg_len + 6, GFP_KERNEL);
+	if (!out)
+		goto out_free;
+
+	out_len = scnprintf(out, tag_len + msg_len + 6, "%c %.*s: %.*s\n",
+			    log_characters[prio], (int)tag_len, tag,
+			    (int)msg_len, msg);
+	pmsg_write(out, out_len);
+
+	kfree(out);
+out_free:
+	kfree(buf);
+}
+
 static ssize_t pmsg_write_iter(struct kiocb *iocb, struct iov_iter *from)
 {
 	size_t count = iov_iter_count(from);
@@ -218,6 +274,8 @@ static ssize_t pmsg_write_iter(struct kiocb *iocb, struct iov_iter *from)
 		    pmsg_is_header(i, iov) ||
 		    pmsg_is_tag(i, iov)) {
 			/* continue */
+		} else if (pmsg_is_payload(i, from->nr_segs, iov)) {
+			pmsg_write_payload(iov);
 		} else if (pmsg_is_prio(i, iov, priority)) {
 			pmsg_write_arr(priority);
 		} else if (pmsg_is_name_tag(i)) {
